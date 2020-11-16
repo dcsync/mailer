@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import argparse
+import itertools
+import threading
+import concurrent.futures
+import traceback
+import re
+import time
+import traceback
+import smtplib
+import email
+import email.mime
+import email.mime.base
+import email.parser
+import email.encoders
+import bs4
+import uuid
+import random
+
+import utils
+
+# defaults
+default_max_threads = 10
+default_port = 465
+default_timeout = 30
+
+def parse_email_line(line):
+    """
+    Parse an email line.
+    
+    Parsed either 'First Last <email@example.com>' format,
+    'email@example.com\tFirst Last', or just an email.
+
+    Returned name will be None if there is none specified.
+
+    :param line: Line to parse
+    :return: Tuple containing (email, name)
+    """
+
+    name = None
+    email = None
+
+    # match pair?
+    m = re.search('^([^<]+)<([^>]+)>', line)
+    if m:
+        name = m.group(1).strip()
+        email = m.group(2).strip()
+    else:
+        # match tsv?
+        m = re.match('([^\t]+)\t(.+)', line)
+        if m:
+            email = m.group(1).strip()
+            name = m.group(2).strip()
+        else:
+            # is it just an email?
+            if '@' in line:
+                email = line.strip()
+
+    return email, name
+
+def replace_tokens(text, replacements):
+    """
+    Replace tokens in text
+
+    :param text: Text to replace in
+    :param replacements: Dictionary containing {token: replacement}
+    :return: Updated text
+    """
+
+    for token, value in replacements.items():
+        if isinstance(text, bytes):
+            text = text.replace(token.encode(), value.encode())
+        else:
+            text = text.replace(token, value)
+
+        return text
+
+class Mailer:
+    def __init__(self, server, user, password, template, targets,
+            port=default_port,
+            delay=None,
+            tls=True, from_email=None, from_name=None, subject=None, cc=None, no_name_template=None,
+            encode=True,
+            generated_plaintext=True,
+            replace_tokens=True,
+            random_message_id=True,
+            clean_headers=True,
+            timeout=default_timeout,
+            max_threads=default_max_threads):
+        # params
+        self.server = server
+        self.port = port
+        self.user = user
+        self.password = password
+        self.template = template
+        self.no_name_template = no_name_template
+        self.targets = iter(targets)
+
+        self.delay = delay
+        self.tls = tls
+        if from_email:
+            self.from_email = from_email
+        else:
+            self.from_email = user
+        self.from_name = from_name
+        self.subject = subject
+        self.cc = cc
+        self.encode = encode
+        self.generated_plaintext = generated_plaintext
+        self.replace_tokens = replace_tokens
+        self.random_message_id = random_message_id
+        self.clean_headers = clean_headers
+
+        self.timeout = timeout
+        self.max_threads = max_threads
+
+        self.output_lock = threading.Lock()
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads)
+        self.running = False
+        self.futures = set()
+
+    def stop_softly(self):
+        for future in self.futures:
+            if not future.running():
+                future.cancel()
+
+    def stop(self):
+        self.stop_softly()
+        self.running = False
+
+    def handle_completed_futures(self, futures):
+        for future in futures:
+            if not future.done():
+                raise RuntimeError('attempted to handle unfinished future')
+
+            try:
+                ex = future.exception()
+                if ex:
+                    raise ex
+            except Exception as e:
+                utils.bad('Received an exception from a future:')
+                if not isinstance(e, concurrent.futures._base.CancelledError):
+                    traceback.print_exc(limit=6)
+
+    def mail(self, target):
+        target_email, target_name = target
+
+        if target_name:
+            template = self.template
+        else:
+            if self.no_name_template:
+                template = self.no_name_template
+            else:
+                # improvise with the regular template
+                target_name = target_email
+                template = self.template
+
+        parser = email.parser.FeedParser()
+        parser.feed(template)
+        parsed = parser.close()
+
+        # generate random Message-ID header?
+        if self.random_message_id:
+            # delete existing Message-ID headers
+            for header in parsed:
+                if header.lower() == 'message-id':
+                    del parsed[header]
+
+            domain = self.from_email.split('@')[1]
+            token = uuid.uuid4().hex
+            parsed['Message-ID'] = '<{}@{}>'.format(token, domain)
+
+        # clean up headers?
+        if self.clean_headers:
+            for header in parsed:
+                header = header.lower()
+                if header.startswith('x-') or header in ['delivered-to']:
+                    utils.debug('removing header: {}'.format(header))
+                    del parsed[header]
+
+        # From
+        if self.from_name:
+            pretty_from = '{} <{}>'.format(self.from_name, self.from_email)
+        else:
+            pretty_from = '{} <{}>'.format(self.from_email, self.from_email)
+        del parsed['From']
+        del parsed['Return-Path']
+        parsed['From'] = pretty_from
+        parsed['Return-Path'] = '<{}>'.format(self.from_email)
+
+        # Subject
+        if self.subject:
+            del parsed['Subject']
+
+            if self.replace_tokens:
+                # replace tokens
+                parsed['Subject'] = replace_tokens(self.subject, {'%To_Name%': target_name})
+            else:
+                parsed['Subject'] = self.subject
+
+        # CC
+        if self.cc:
+            del parsed['CC']
+            parsed['CC'] = self.cc
+
+        # To
+        if target_name:
+            to = '{} <{}>'.format(target_name, target_email)
+        else:
+            to = '{} <{}>'.format(target_email, target_email)
+        del parsed['To']
+        parsed['To'] = to
+
+        # Clean up headers
+        del parsed['Received']
+
+        # Run through message parts
+        if parsed.is_multipart():
+            text_part = None
+            html_part = None
+
+            # Find first 'multipart/related' part
+            multipart_section = None
+            for part in parsed.walk():
+                if part.get_content_type() in ('multipart/related', 'multipart/alternative'):
+                    multipart_section = part
+                    break
+
+            if not multipart_section:
+                utils.die('no multipart attachment found')
+
+            #print('=======')
+            #print(multipart_section)
+            #print('=======')
+            #print(multipart_section.get_payload())
+            #print('=======')
+            #print(multipart_section.get_payload()[0])
+            #print('=======')
+            #print(multipart_section.get_payload()[1])
+            #print('=======')
+
+            for part in multipart_section.get_payload():
+                if part.get_content_type() == 'text/html' and \
+                    'attachment' not in str(part.get('Content-Disposition')):
+                    html_part = part
+
+                if part.get_content_type() == 'text/plain' and \
+                    'attachment' not in str(part.get('Content-Disposition')):
+                    text_part = part
+
+                if not (html_part or text_part):
+                    utils.die('no html or text attachment in template')
+                    return
+
+                # parse html part
+                if html_part:
+                    html = html_part.get_payload(decode=True)
+                    del html_part['Content-Transfer-Encoding']
+                else:
+                    html = None
+
+                # parse text part
+                if text_part:
+                    text = text_part.get_payload(decode=True)
+                    del text_part['Content-Transfer-Encoding']
+                elif self.generated_plaintext:
+                    soup = bs4.BeautifulSoup(html, features="lxml")
+                    text = soup.get_text(separator='\n')
+                    text_part = email.mime.base.MIMEBase('text', 'plain')
+                    text_part.set_payload(text)
+                    multipart_section.attach(text_part)
+                else:
+                    text = None
+
+                    
+                # set tokens for text part
+                if text_part:
+                    if self.replace_tokens:
+                        # replace tokens
+                        text = replace_tokens(text, {'%To_Name%': target_name})
+
+                    # switch out payloads
+                    text_part.set_payload(text)
+
+                # set tokens for html part
+                if html_part:
+                    if self.replace_tokens:
+                        # replace tokens
+                        html = replace_tokens(html, {'%To_Name%': target_name})
+
+                    html_part.set_payload(html)
+
+                # re-encode
+                if self.encode:
+                    if text_part:
+                        email.encoders.encode_base64(text_part)
+
+                    if html_part:
+                        email.encoders.encode_base64(html_part)
+        else:
+            # single part message
+            text = parsed.get_payload(decode=True)
+
+            if self.replace_tokens:
+                # replace tokens
+                text = replace_tokens(text, {'%To_Name%': target_name})
+
+            # switch out payload
+            parsed.set_payload(text)
+
+        utils.debug(parsed.as_string())
+
+        try:
+            # initiate connection
+            utils.debug('initiating server connection to {}:{}'.format(self.server, self.port))
+            if self.tls:
+                utils.debug('using SMTP_SSL instance')
+                server = smtplib.SMTP_SSL(self.server, self.port, local_hostname=None, timeout=self.timeout)
+            else:
+                server = smtplib.SMTP(self.server, self.port, local_hostname=None, timeout=self.timeout)
+
+            # STARTTLS
+            #if self.starttls:
+            #    utils.debug('attempting STARTTLS')
+            #    server.starttls()
+
+            # auth
+            utils.debug('logging in as {}:{}'.format(self.user, self.password))
+            server.login(self.user, self.password)
+
+            # random delay before sending
+            if self.delay:
+                delay = random.uniform(0, self.delay)
+                utils.debug('sleeping for {} seconds'.format(delay))
+                time.sleep(delay)
+
+            # send message
+            utils.debug('submitting message')
+            server.sendmail(self.from_email, [target_email], parsed.as_string())
+        except Exception as e:
+            utils.bad('Failed: {}'.format(to))
+            raise type(e)('For {}: {}'.format(to, e.strerror))
+        else:
+            utils.good('Success: {}'.format(to))
+
+        server.quit()
+
+    def start(self):
+        self.running = True
+
+        while self.running:
+            # submit items
+            for target in self.targets:
+                #if len(self.futures) > self.max_threads:
+                #    break
+
+                future = self.thread_pool.submit(self.mail, target)
+                self.futures.add(future)
+
+            utils.debug('waiting for {} futures'.format(len(self.futures)))
+            done, self.futures = concurrent.futures.wait(self.futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            utils.debug('handling {} completed futures'.format(len(done)))
+            self.handle_completed_futures(done)
+
+            if not self.futures:
+                # all finished
+                utils.good('All finished')
+                self.running = False
+                break
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # main options
+    parser.add_argument('-f', '--target-file', required=True,
+            help="file containing email addresses to mail to (in email@example.com, 'First Last <email@example.com>', or 'email@example.com\\tFirst Last' formats)")
+    parser.add_argument('--no-shuffle', action='store_true',
+            help='do not shuffle target list')
+    parser.add_argument('--timeout', type=int, default=default_timeout,
+            help='SMTP timeout (default: {})'.format(default_timeout))
+    parser.add_argument('-T', '--max-threads', type=int, default=default_max_threads,
+            help='maximum number of mailing threads (default: {})'.format(default_max_threads))
+    parser.add_argument('-s', '--server', required=True,
+            help='server to submit to')
+    parser.add_argument('-P', '--port', type=int, default=default_port,
+            help='server to submit to (default: {})'.format(default_port))
+    parser.add_argument('--no-tls', action='store_true',
+            help='do not use TLS')
+    parser.add_argument('-u', '--user', required=True,
+            help='login user')
+    parser.add_argument('-p', '--password', required=True,
+            help='login password')
+    parser.add_argument('-d', '--delay', type=int,
+            help='random delay up to X seconds')
+    parser.add_argument('-t', '--template', required=True,
+            help='.eml template')
+    parser.add_argument('--from-email',
+            help='from email (default: value of --user)')
+    parser.add_argument('--from-name',
+            help='from name (default: value of --from-email)')
+    parser.add_argument('--subject',
+            help='email subject')
+    parser.add_argument('--cc',
+            help='CC line')
+    parser.add_argument('--no-encoding', action='store_true',
+            help='do not base64 encode email parts')
+    parser.add_argument('--no-generated-plaintext', action='store_true',
+            help='do not generate plaintext if message is HTML')
+    parser.add_argument('--no-replace-tokens', action='store_true',
+            help='do not replace %%To_Name%% tokens in text or subject')
+    parser.add_argument('--no-random-message-id', action='store_true',
+            help='do not add a random Message-ID header')
+    parser.add_argument('--no-clean-headers', action='store_true',
+            help='do not remove X- and Delivered-To headers')
+    parser.add_argument('-D', '--debug', action='store_true',
+            help='debug mode')
+
+    args = parser.parse_args()
+
+    # -D/--debug
+    utils.debug_enabled = args.debug
+
+    # -t/--template
+    with open(args.template, 'r') as fp:
+        template = fp.read()
+
+    from_name = None
+    # --from-email
+    if args.from_email:
+        from_email, from_name = parse_email_line(args.from_email)
+    else:
+        if '@' in args.user:
+            utils.bad('No From email specified. Defaulting to {}'.format(args.user))
+            from_email = args.user
+        else:
+            utils.die("No From email specified. Value from --user doesn't look like an email address. Specify a From email with --from-email")
+
+    # --from-name
+    if args.from_name:
+        from_name = args.from_name
+
+    if not from_name:
+        utils.bad('No From name specified. Defaulting to {}'.format(from_email))
+        from_name = from_email
+
+    # Get targets
+    targets = []
+    # -f/--target-file
+    with open(args.target_file, 'r') as fp:
+        for line in fp:
+            email, name = parse_email_line(line)
+            if not email:
+                utils.die('bad email line: {}'.format(line))
+            if not name:
+                name = email
+            targets.append((email, name))
+
+    # --no-shuffle
+    if not args.no_shuffle:
+        random.shuffle(targets)
+
+    utils.good('Mailing to {} target(s)'.format(len(targets)))
+    mailer = Mailer(args.server, args.user, args.password, template,
+            targets,
+            port=args.port,
+            delay=args.delay,
+            tls=not args.no_tls,
+            from_email=from_email, from_name=from_name,
+            subject=args.subject, cc=args.cc,
+            encode=not args.no_encoding,
+            generated_plaintext=not args.no_generated_plaintext,
+            replace_tokens=not args.no_replace_tokens,
+            random_message_id=not args.no_random_message_id,
+            clean_headers=not args.no_clean_headers,
+            timeout=args.timeout,
+            max_threads=args.max_threads)
+    mailer.start()
+
+if __name__ == '__main__':
+    main()
